@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::json;
 use tauri::{async_runtime::spawn, AppHandle, Emitter, Manager};
@@ -7,7 +7,6 @@ use tokio::{
     time,
 };
 use tracing::{debug, error, Level};
-use uuid::Uuid;
 
 use proto::{
     tcp::serve,
@@ -21,33 +20,14 @@ struct AppState {
     peers: PeerMap,
 }
 
-fn get_info() -> anyhow::Result<Info> {
-    let path = PathBuf::from("device.json");
-
-    let info = if path.exists() {
-        let data = std::fs::read(&path)?;
-        serde_json::from_slice::<Info>(&data)?
-    } else {
-        let info = Info {
-            id: Uuid::new_v4(),
-            alias: "Peer".into(),
-            port: 8000,
-        };
-        std::fs::write(&path, serde_json::to_vec_pretty(&info)?)?;
-        info
-    };
-
-    Ok(info)
-}
-
 pub async fn emiter(handle: AppHandle, mut rx: mpsc::Receiver<Event>) -> anyhow::Result<()> {
     while let Some(event) = rx.recv().await {
         match event {
             Event::Join(peer) => {
-                handle.emit("discover", json!({"kind": "join", "peer": peer}))?;
+                handle.emit("events", json!({"kind": "join", "peer": peer}))?;
             }
             Event::Leave(id) => {
-                handle.emit("discover", json!({"kind": "leave", "id": id}))?;
+                handle.emit("events", json!({"kind": "leave", "id": id}))?;
             }
         };
     }
@@ -80,7 +60,7 @@ pub async fn cleanup(peers: PeerMap, tx: mpsc::Sender<Event>) {
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
-        info: Arc::new(get_info()?),
+        info: Arc::new(Info::from_path("device.json")?),
         peers: Arc::new(Mutex::new(HashMap::new())),
     };
 

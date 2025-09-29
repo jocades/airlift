@@ -1,17 +1,14 @@
-use std::{
-    io::BufRead,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::{Level, error};
+use proto::udp::announce;
+use tracing::Level;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, default_value_t = proto::TCP_PORT)]
+    #[arg(long, default_value_t = 8000)]
     port: u16,
     #[command(subcommand)]
     command: Command,
@@ -48,7 +45,7 @@ async fn main() -> Result<()> {
         }
         Command::Announce { alias } => {
             info.alias = alias;
-            proto::announce(Arc::new(info)).await?;
+            announce(Arc::new(info)).await?;
         }
     }
 
