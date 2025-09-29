@@ -1,31 +1,104 @@
-use proto::{listen, serve, Info, Metadata, Peer};
-use std::{collections::HashMap, sync::Arc};
-use tauri::{
-    async_runtime::{channel, spawn},
-    Emitter, Manager,
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+
+use serde_json::json;
+use tauri::{async_runtime::spawn, AppHandle, Emitter, Manager};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time,
 };
-use tokio::sync::Mutex;
-use tracing::{error, Level};
+use tracing::{debug, error, Level};
 use uuid::Uuid;
 
-const TCP_PORT: u16 = 8001;
+use proto::{
+    tcp::serve,
+    udp::{announce, listen},
+    Event, Info, PeerMap,
+};
 
 #[derive(Clone)]
 struct AppState {
     info: Arc<Info>,
-    peers: Arc<Mutex<Vec<Peer>>>,
-    // offers: Arc<Mutex<HashMap<Uuid, Metadata>>>,
+    peers: PeerMap,
+}
+
+fn get_info() -> anyhow::Result<Info> {
+    let path = PathBuf::from("device.json");
+
+    let info = if path.exists() {
+        let data = std::fs::read(&path)?;
+        serde_json::from_slice::<Info>(&data)?
+    } else {
+        let info = Info {
+            id: Uuid::new_v4(),
+            alias: "Peer".into(),
+            port: 8000,
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&info)?)?;
+        info
+    };
+
+    Ok(info)
+}
+
+pub async fn emiter(handle: AppHandle, mut rx: mpsc::Receiver<Event>) -> anyhow::Result<()> {
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::Join(peer) => {
+                handle.emit("discover", json!({"kind": "join", "peer": peer}))?;
+            }
+            Event::Leave(id) => {
+                handle.emit("discover", json!({"kind": "leave", "id": id}))?;
+            }
+        };
+    }
+    Ok(())
+}
+
+pub async fn cleanup(peers: PeerMap, tx: mpsc::Sender<Event>) {
+    let timeout = Duration::from_secs(10);
+    let mut removed = Vec::new();
+
+    loop {
+        let mut peers = peers.lock().await;
+        peers.retain(|_, (peer, last_seen)| {
+            let timedout = last_seen.elapsed() > timeout;
+            if timedout {
+                removed.push(peer.info.id);
+            }
+            !timedout
+        });
+        drop(peers);
+
+        for id in &removed {
+            debug!("Removing {id}");
+            _ = tx.send(Event::Leave(*id)).await;
+        }
+        removed.clear();
+        time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let id = Uuid::new_v4();
-    let peers = Arc::new(Mutex::new(Vec::new()));
+    let state = AppState {
+        info: Arc::new(get_info()?),
+        peers: Arc::new(Mutex::new(HashMap::new())),
+    };
 
-    let (tx, mut rx) = channel(32);
+    let (tx, rx) = mpsc::channel(32);
     {
-        let peers = peers.clone();
+        let (id, peers, tx) = (state.info.id, state.peers.clone(), tx.clone());
+        let callback = async move |peer| _ = tx.send(Event::Join(peer)).await;
         spawn(async move {
-            if let Err(e) = listen(id, peers, tx).await {
+            if let Err(e) = listen(id, peers, callback).await {
+                error!(cause = %e, "listen error");
+            }
+        });
+    }
+
+    {
+        let info = state.info.clone();
+        spawn(async move {
+            if let Err(e) = announce(info).await {
                 error!(cause = %e, "announce error");
             }
         });
@@ -34,28 +107,21 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     {
         let handle = app.handle().clone();
         spawn(async move {
-            while let Some(peer) = rx.recv().await {
-                handle.emit("peer-joined", peer).unwrap();
+            if let Err(e) = emiter(handle, rx).await {
+                error!(cause = %e, "emiter error");
             }
         });
     }
 
-    let info = Info {
-        id,
-        alias: "Peer".into(),
-        port: 8000,
-    };
-
-    let state = AppState {
-        info: Arc::new(info),
-        peers,
-    };
+    {
+        let peers = state.peers.clone();
+        spawn(cleanup(peers, tx));
+    }
 
     {
-        let info = state.info.clone();
-        let peers = state.peers.clone();
-        spawn(async {
-            if let Err(e) = proto::serve(info, peers).await {
+        let port = state.info.port;
+        spawn(async move {
+            if let Err(e) = serve(port).await {
                 error!(cause = %e, "serve error");
             }
         });
